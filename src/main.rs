@@ -1,5 +1,7 @@
 mod block;
 mod blockchain;
+mod config;
+mod node;
 mod proof_of_work;
 mod server;
 mod transaction;
