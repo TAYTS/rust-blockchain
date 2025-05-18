@@ -1,19 +1,25 @@
 use std::{
     error::Error,
     io::{BufReader, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     thread,
     time::Duration,
 };
 
+use data_encoding::HEXLOWER;
 use log::{error, info};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
 use crate::{
-    block::Block, blockchain::Blockchain, config::GLOBAL_CONFIG, node::Nodes,
+    block::Block,
+    blockchain::Blockchain,
+    config::GLOBAL_CONFIG,
+    memory_pool::{BlockInTransit, MemoryPool},
+    node::Nodes,
     transaction::Transaction,
+    utxo_set::UTXOSet,
 };
 
 const NODE_VERSION: usize = 1;
@@ -27,7 +33,9 @@ static GLOBAL_NODES: Lazy<Nodes> = Lazy::new(|| {
     return nodes;
 });
 
-// static GLOBAL_BLOCKS_IN_TRANSIT: Lazy<BlockInTransit> = Lazy::new(|| BlockInTransit::new());
+static GLOBAL_MEMORY_POOL: Lazy<MemoryPool> = Lazy::new(|| MemoryPool::new());
+
+static GLOBAL_BLOCKS_IN_TRANSIT: Lazy<BlockInTransit> = Lazy::new(|| BlockInTransit::new());
 
 const TCP_WRITE_TIMEOUT: u64 = 1000;
 
@@ -180,4 +188,55 @@ fn send_data(addr: SocketAddr, pkg: Package) {
     let _ = stream.set_write_timeout(Option::from(Duration::from_millis(TCP_WRITE_TIMEOUT)));
     let _ = serde_json::to_writer(&stream, &pkg);
     let _ = stream.flush();
+}
+
+fn serve(blockchain: Blockchain, stream: TcpStream) -> Result<(), Box<dyn Error>> {
+    let peer_addr = stream.peer_addr()?;
+    let reader = BufReader::new(&stream);
+    let pkg_reader = Deserializer::from_reader(reader).into_iter::<Package>();
+    for pkg in pkg_reader {
+        let pkg = pkg?;
+        info!("Receive request from {}: {:?}", peer_addr, pkg);
+        match pkg {
+            Package::Block { addr_from, block } => {
+                let block = Block::deserialize(block.as_slice());
+                blockchain.add_block(&block);
+                info!("Added block {}", block.get_hash());
+
+                if GLOBAL_BLOCKS_IN_TRANSIT.len() > 0 {
+                    let block_hash = GLOBAL_BLOCKS_IN_TRANSIT.first().unwrap();
+                    send_get_data(addr_from.as_str(), OpType::Block, &block_hash);
+
+                    GLOBAL_BLOCKS_IN_TRANSIT.remove(&block_hash);
+                } else {
+                    let utxo_set = UTXOSet::new(blockchain.clone());
+                    utxo_set.reindex();
+                }
+            }
+            Package::GetBlocks { addr_from } => {
+                let blocks = blockchain.get_block_hashes();
+                send_inv(&addr_from.as_str(), OpType::Block, &blocks);
+            }
+            Package::GetData {
+                addr_from,
+                op_type,
+                id,
+            } => match op_type {
+                OpType::Block => {
+                    if let Some(block) = blockchain.get_block(id.as_slice()) {
+                        send_block(addr_from.as_str(), &block);
+                    }
+                }
+                OpType::Tx => {
+                    let txid_hex = HEXLOWER.encode(id.as_slice());
+                    if let Some(tx) = GLOBAL_MEMORY_POOL.get(txid_hex.as_str()) {
+                        send_tx(addr_from.as_str(), &tx);
+                    }
+                }
+            },
+        }
+    }
+
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
 }
