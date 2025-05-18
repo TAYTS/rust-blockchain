@@ -7,6 +7,7 @@ mod proof_of_work;
 mod server;
 mod transaction;
 mod utils;
+mod utxo_set;
 mod wallet;
 
 pub(crate) fn current_timestamp() -> i64 {
